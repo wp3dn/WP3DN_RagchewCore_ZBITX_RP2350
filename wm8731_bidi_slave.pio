@@ -1,0 +1,72 @@
+; WM8731 bidirectional Philips-I2S slave for the fixed AudioInjector mapping.
+; GPIO18 BCLK, GPIO19 LRCLK, GPIO20 ADCDAT, GPIO21 DACDAT.
+; Derived from the i2s_bidi_slave concept in malacalypse/rp2040_i2s_example.
+; The important adaptation is that DIN no longer has to precede BCLK/LRCLK.
+
+.program wm8731_bidi_slave
+
+start_l:
+    wait 1 gpio 18
+    in pins, 1
+    pull noblock
+    push noblock
+    wait 0 gpio 18
+
+public public_entry_point:
+    wait 0 gpio 19
+    out pins, 1
+
+loop_l:
+    wait 1 gpio 18
+    in pins, 1
+    wait 0 gpio 18
+    out pins, 1
+    jmp pin start_r
+    jmp loop_l
+
+start_r:
+    wait 1 gpio 18
+    in pins, 1
+    pull noblock
+    push noblock
+    wait 0 gpio 18
+    out pins, 1
+
+loop_r:
+    wait 1 gpio 18
+    in pins, 1
+    wait 0 gpio 18
+    out pins, 1
+    jmp pin loop_r
+
+% c-sdk {
+static inline void wm8731_bidi_slave_program_init(PIO pio, uint sm, uint offset,
+                                                   uint din_pin, uint dout_pin,
+                                                   uint lrclk_pin,
+                                                   float sm_clock_hz) {
+    pio_gpio_init(pio, din_pin);
+    pio_gpio_init(pio, dout_pin);
+    pio_gpio_init(pio, 18);
+    pio_gpio_init(pio, lrclk_pin);
+
+    gpio_set_pulls(din_pin, false, false);
+    gpio_set_pulls(18, false, false);
+    gpio_set_pulls(lrclk_pin, false, false);
+
+    pio_sm_config c = wm8731_bidi_slave_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, din_pin);
+    sm_config_set_out_pins(&c, dout_pin, 1);
+    sm_config_set_jmp_pin(&c, lrclk_pin);
+    sm_config_set_in_shift(&c, false, false, 32);
+    sm_config_set_out_shift(&c, false, false, 32);
+
+    float div = (float)clock_get_hz(clk_sys) / sm_clock_hz;
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset + wm8731_bidi_slave_offset_public_entry_point, &c);
+    pio_sm_set_consecutive_pindirs(pio, sm, din_pin, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, 18, 2, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, dout_pin, 1, true);
+    pio_sm_set_pins_with_mask(pio, sm, 0, 1u << dout_pin);
+}
+%}

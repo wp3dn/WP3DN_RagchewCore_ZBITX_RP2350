@@ -1,0 +1,39 @@
+.program i2c_pio_edges
+.side_set 1 pindirs
+.origin 0
+; PIO2, SDA GP13, SCL GP6. All GPIO output latches remain LOW.
+; Side-set 1 drives SCL low; side-set 0 releases SCL.
+; OUT PINDIRS 1 drives/releases SDA. Commands encode 5-bit PC + SDA bit.
+.wrap_target
+idle_dispatch:
+    pull block          side 0
+    out pc, 5           side 0
+low_dispatch:
+    pull block          side 1
+    out pc, 5           side 1
+public bit_cycle:
+    out pindirs, 1      side 1
+    nop                 side 0
+    wait 1 gpio 6       side 0
+    in pins, 1          side 0
+    nop                 side 1
+    push block          side 1
+    jmp low_dispatch    side 1
+public start_cycle:
+    set pindirs, 0      side 1
+    nop                 side 0
+    wait 1 gpio 6       side 0
+    set pindirs, 1      side 0
+    nop                 side 1
+    mov isr, null       side 1
+    push block          side 1
+    jmp low_dispatch    side 1
+public stop_cycle:
+    set pindirs, 1      side 1
+    nop                 side 0
+    wait 1 gpio 6       side 0
+    set pindirs, 0      side 0
+    mov isr, null       side 0
+    push block          side 0
+    jmp idle_dispatch   side 0
+.wrap

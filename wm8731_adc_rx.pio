@@ -1,0 +1,64 @@
+; Dedicated WM8731 Philips-I2S ADC receiver.
+; Fixed AudioInjector mapping: GPIO18 BCLK, GPIO19 LRCLK, GPIO20 ADCDAT.
+; Captures the 16 valid bits from each channel and pushes one 32-bit FIFO word
+; per channel. The signed 16-bit sample is in bits 15:0. Philips-I2S has a
+; one-BCLK delay after each LRCLK transition, so the first bit after the edge
+; is ignored before capturing the 16-bit word.
+;
+; This runs on a separate PIO block/SM so the proven bidirectional DAC state
+; machine remains unchanged.
+
+.program wm8731_adc_rx
+
+.wrap_target
+    ; Synchronize to the start of a LEFT word (LRCLK high -> low transition).
+    wait 1 gpio 19
+    wait 0 gpio 19
+    wait 1 gpio 18
+    wait 0 gpio 18
+    set x, 15
+left_bits:
+    wait 1 gpio 18
+    in pins, 1
+    wait 0 gpio 18
+    jmp x-- left_bits
+    push block
+
+    ; Synchronize to the start of the RIGHT word (LRCLK low -> high transition).
+    wait 1 gpio 19
+    wait 1 gpio 18
+    wait 0 gpio 18
+    set x, 15
+right_bits:
+    wait 1 gpio 18
+    in pins, 1
+    wait 0 gpio 18
+    jmp x-- right_bits
+    push block
+.wrap
+
+% c-sdk {
+static inline void wm8731_adc_rx_program_init(PIO pio, uint sm, uint offset,
+                                               uint din_pin,
+                                               float sm_clock_hz) {
+    pio_gpio_init(pio, din_pin);
+    pio_gpio_init(pio, 18);
+    pio_gpio_init(pio, 19);
+
+    gpio_set_pulls(din_pin, false, false);
+    gpio_set_pulls(18, false, false);
+    gpio_set_pulls(19, false, false);
+
+    pio_sm_config c = wm8731_adc_rx_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, din_pin);
+    sm_config_set_in_shift(&c, false, false, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    float div = (float)clock_get_hz(clk_sys) / sm_clock_hz;
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_consecutive_pindirs(pio, sm, din_pin, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, 18, 2, false);
+}
+%}

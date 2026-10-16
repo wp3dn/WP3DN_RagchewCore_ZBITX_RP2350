@@ -1,0 +1,202 @@
+#include "audio/ssb_tx.h"
+
+#include <math.h>
+#include <string.h>
+#include "audio/audio_filter.h"
+
+/*
+ * Experimental linear-path diagnostic build.
+ * - 129-tap optimized Hilbert transformer
+ * - DC blocker retained
+ * - TX audio bandpass bypassed
+ * - per-band multiplier bypassed (unity)
+ * - no gate, compressor, limiter, or intentional dead zone
+ */
+
+#define HILBERT_TAPS 129
+#define HILBERT_DELAY 64
+#define SINE_SIZE 256
+
+/* Experimental 129-tap Hilbert transformer.
+ * Every other coefficient is zero, and the processing loop skips those
+ * entries, so it performs 64 MACs per sample (about the same number of
+ * useful multiplies as the previous 65-tap implementation).
+ */
+static const int16_t hilbert_q15[HILBERT_TAPS] = {
+    0, -1, 0, -2, 0, -4, 0, -7, 0, -11, 0, -16, 0, -22, 0, -31,
+    0, -42, 0, -55, 0, -71, 0, -91, 0, -115, 0, -144, 0, -178, 0, -218,
+    0, -265, 0, -320, 0, -385, 0, -461, 0, -551, 0, -657, 0, -784, 0, -938,
+    0, -1129, 0, -1373, 0, -1697, 0, -2152, 0, -2849, 0, -4078, 0, -6897, 0, -20842,
+    0, 20842, 0, 6897, 0, 4078, 0, 2849, 0, 2152, 0, 1697, 0, 1373, 0, 1129,
+    0, 938, 0, 784, 0, 657, 0, 551, 0, 461, 0, 385, 0, 320, 0, 265,
+    0, 218, 0, 178, 0, 144, 0, 115, 0, 91, 0, 71, 0, 55, 0, 42,
+    0, 31, 0, 22, 0, 16, 0, 11, 0, 7, 0, 4, 0, 2, 0, 1,
+    0
+};
+
+
+static int16_t sine_table[SINE_SIZE];
+static uint32_t sample_rate_hz = 96000u;
+static uint32_t tx_if_hz = 24000u;
+static uint32_t mixer_phase;
+static uint32_t mixer_phase_inc;
+static int32_t mic_dc_q8;
+static bool mic_dc_valid;
+static int32_t hilbert_hist[HILBERT_TAPS];
+static int32_t delay_hist[HILBERT_TAPS];
+static uint8_t hist_pos;
+static volatile bool enabled = false;
+static volatile uint16_t mic_gain_percent = 100u;
+static volatile uint8_t drive_percent = 10u;
+static volatile uint32_t band_multiplier_q16 = 65536u;
+static volatile uint32_t clip_count;
+static volatile int32_t mic_peak;
+static volatile int32_t dac_peak;
+static uint32_t lead_samples;
+static uint16_t tx_low_hz=300u, tx_high_hz=2500u;
+static audio_bandpass_t tx_filter;
+
+static uint32_t phase_inc_for_hz(uint32_t hz) {
+    return (uint32_t)(((uint64_t)hz << 32) / sample_rate_hz);
+}
+
+void ssb_tx_init(uint32_t sample_rate, uint32_t if_hz) {
+    sample_rate_hz = sample_rate ? sample_rate : 96000u;
+    for (uint32_t i = 0; i < SINE_SIZE; ++i) {
+        float a = 2.0f * (float)M_PI * (float)i / (float)SINE_SIZE;
+        sine_table[i] = (int16_t)lroundf(32767.0f * sinf(a));
+    }
+    ssb_tx_set_if_hz(if_hz);
+    audio_bandpass_config(&tx_filter, sample_rate_hz, tx_low_hz, tx_high_hz);
+    ssb_tx_reset();
+}
+
+void ssb_tx_reset(void) {
+    mixer_phase = 0;
+    mic_dc_q8 = 0;
+    mic_dc_valid = false;
+    hist_pos = 0;
+    clip_count = 0;
+    mic_peak = 0;
+    dac_peak = 0;
+    audio_bandpass_reset(&tx_filter);
+    lead_samples = sample_rate_hz / 100u; // 10 ms relay/audio settling time
+    memset(hilbert_hist, 0, sizeof(hilbert_hist));
+    memset(delay_hist, 0, sizeof(delay_hist));
+}
+
+static int16_t clamp16_tx(int64_t sample) {
+    if (sample > 32767) { clip_count++; return 32767; }
+    if (sample < -32768) { clip_count++; return -32768; }
+    return (int16_t)sample;
+}
+
+int16_t ssb_tx_process(int16_t mic_sample, ssb_tx_sideband_t sideband) {
+    int32_t raw = mic_sample;
+    int32_t ar = raw < 0 ? -raw : raw;
+    if (ar > mic_peak) mic_peak = ar;
+
+    if (!enabled) return 0;
+
+    if (!mic_dc_valid) {
+        mic_dc_q8 = raw << 8;
+        mic_dc_valid = true;
+    }
+    mic_dc_q8 += (((raw << 8) - mic_dc_q8) >> 10);
+    int32_t centered = raw - (mic_dc_q8 >> 8);
+
+    /*
+     * Apply the user-adjustable TX voice band-pass before the Hilbert network.
+     * tx_low_hz controls the high-pass corner and tx_high_hz controls the
+     * low-pass corner.
+     */
+    int32_t filtered = audio_bandpass_process(&tx_filter, centered);
+    int32_t mic = (int32_t)(((int64_t)filtered * mic_gain_percent) / 100);
+
+    /* Feed the filtered microphone into the phasing network. */
+    hilbert_hist[hist_pos] = mic;
+    delay_hist[hist_pos] = mic;
+
+    int64_t acc = 0;
+
+    /* Only odd-numbered taps are non-zero.  The sample for coefficient k is
+     * hist_pos-k in the circular history buffer.
+     */
+    for (uint16_t k = 1; k < HILBERT_TAPS; k += 2) {
+        uint16_t rp = (uint16_t)hist_pos + HILBERT_TAPS - k;
+        if (rp >= HILBERT_TAPS) rp -= HILBERT_TAPS;
+        acc += (int64_t)hilbert_q15[k] * hilbert_hist[rp];
+    }
+    uint8_t delay_pos = (uint8_t)((hist_pos + HILBERT_TAPS - HILBERT_DELAY) % HILBERT_TAPS);
+    int32_t i_sample = delay_hist[delay_pos];
+    int32_t q_sample = (int32_t)(acc >> 15);
+    hist_pos++;
+    if (hist_pos >= HILBERT_TAPS) hist_pos = 0;
+
+    mixer_phase += mixer_phase_inc;
+    uint8_t idx = (uint8_t)(mixer_phase >> 24);
+    int32_t cosv = sine_table[(uint8_t)(idx + 64)];
+    int32_t sinv = sine_table[idx];
+
+    int64_t mod = (sideband == SSB_TX_USB)
+        ? ((int64_t)i_sample * cosv - (int64_t)q_sample * sinv)
+        : ((int64_t)i_sample * cosv + (int64_t)q_sample * sinv);
+    mod >>= 15;
+    /*
+     * LINEAR DIAGNOSTIC:
+     * Bypass per-band output calibration. The old calibration can be restored
+     * after the transfer curve has been verified.
+     */
+    (void)band_multiplier_q16;
+
+    if (lead_samples) {
+        lead_samples--;
+        return 0;
+    }
+
+    int32_t am = mod < 0 ? (int32_t)(-mod) : (int32_t)mod;
+    if (am > dac_peak) dac_peak = am;
+    return clamp16_tx(mod);
+}
+
+void ssb_tx_set_enabled(bool value) { enabled = value; }
+bool ssb_tx_get_enabled(void) { return enabled; }
+
+bool ssb_tx_set_mic_gain(uint16_t percent) {
+    if (percent > 1600u) return false;
+    mic_gain_percent = percent;
+    return true;
+}
+uint16_t ssb_tx_get_mic_gain(void) { return mic_gain_percent; }
+
+bool ssb_tx_set_drive(uint8_t percent) {
+    if (percent > 100u) return false;
+    drive_percent = percent;
+    return true;
+}
+uint8_t ssb_tx_get_drive(void) { return drive_percent; }
+void ssb_tx_set_band_multiplier_q16(uint32_t multiplier_q16) { band_multiplier_q16 = multiplier_q16; }
+uint32_t ssb_tx_get_band_multiplier_q16(void) { return band_multiplier_q16; }
+
+bool ssb_tx_set_if_hz(uint32_t hz) {
+    if (hz < 1000u || hz > (sample_rate_hz / 2u - 1000u)) return false;
+    tx_if_hz = hz;
+    mixer_phase_inc = phase_inc_for_hz(hz);
+    return true;
+}
+uint32_t ssb_tx_get_if_hz(void) { return tx_if_hz; }
+uint32_t ssb_tx_get_clip_count(void) { return clip_count; }
+int32_t ssb_tx_get_mic_peak(void) { return mic_peak; }
+int32_t ssb_tx_get_dac_peak(void) { return dac_peak; }
+
+
+bool ssb_tx_set_filter(uint16_t low_hz, uint16_t high_hz) {
+    if (low_hz < 50u) low_hz=50u; if (low_hz>1000u) low_hz=1000u;
+    if (high_hz<1200u) high_hz=1200u; if (high_hz>4000u) high_hz=4000u;
+    if ((uint16_t)(high_hz-low_hz)<500u) {
+        if (low_hz+500u<=4000u) high_hz=low_hz+500u; else low_hz=high_hz-500u;
+    }
+    tx_low_hz=low_hz; tx_high_hz=high_hz;
+    audio_bandpass_config(&tx_filter,sample_rate_hz,low_hz,high_hz); audio_bandpass_reset(&tx_filter); return true;
+}
+uint16_t ssb_tx_get_low_hz(void){return tx_low_hz;} uint16_t ssb_tx_get_high_hz(void){return tx_high_hz;}
